@@ -41,6 +41,29 @@ class ModelBrowserTests(unittest.TestCase):
         self.assertEqual(app.model_price('0.000003'), '$3.00')
 
 
+class OllamaTests(unittest.TestCase):
+    def test_normalize_ollama_models(self):
+        rows = app.normalize_ollama_models({'models': [
+            {'name': 'llama3.1:8b', 'modified_at': 'today', 'size': 123, 'details': {'family': 'llama'}},
+            {'name': 'qwen2.5-coder:latest'}]})
+        self.assertEqual([r['id'] for r in rows], ['llama3.1:8b', 'qwen2.5-coder:latest'])
+        self.assertEqual(rows[0]['provider'], 'ollama')
+        self.assertEqual(app.catalog_provider(rows[0]), 'ollama')
+
+    def test_ollama_launch_env(self):
+        env = app.launch_env('', 'llama3.1:8b', {'ANTHROPIC_AUTH_TOKEN': 'old', 'OPENROUTER_API_KEY': 'old'},
+                             provider=app.PROVIDER_OLLAMA, base_url='http://localhost:11434/')
+        self.assertEqual(env['ANTHROPIC_BASE_URL'], 'http://localhost:11434')
+        self.assertEqual(env['ANTHROPIC_AUTH_TOKEN'], 'ollama')
+        self.assertEqual(env['ANTHROPIC_MODEL'], 'llama3.1:8b')
+        self.assertNotIn('OPENROUTER_API_KEY', env)
+
+    def test_base_url_validation(self):
+        with self.assertRaises(ValueError):
+            app.normalize_base_url('localhost:11434')
+        self.assertEqual(app.normalize_base_url('http://localhost:11434/'), 'http://localhost:11434')
+
+
 class ProbeTests(unittest.TestCase):
     def fake_api(self, token, path, body=None):
         self.assertEqual(path, 'messages')

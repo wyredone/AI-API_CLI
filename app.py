@@ -21,6 +21,10 @@ import hashlib
 import webbrowser
 
 BASE_URL = 'https://openrouter.ai/api'
+OLLAMA_BASE_URL = 'http://localhost:11434'
+PROVIDER_OPENROUTER = 'openrouter'
+PROVIDER_OLLAMA = 'ollama'
+PROVIDER_LABELS = {PROVIDER_OPENROUTER: 'OpenRouter', PROVIDER_OLLAMA: 'Ollama'}
 ENV_KEYS = {'ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY',
             'ANTHROPIC_MODEL', 'CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY',
             'ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL',
@@ -71,20 +75,41 @@ def is_batch_model(model):
     return 'batch' in model.strip().casefold().split(':')[1:]
 
 
-def launch_env(key, model, parent=None):
-    if is_batch_model(model):
-        raise ValueError('Batch-only models cannot run an interactive Claude session. Select the model without :batch.')
+def clean_launch_env(parent=None):
     env = dict(os.environ if parent is None else parent)
     for name in list(env):
         if name.startswith(('ANTHROPIC_', 'CLAUDE_CODE_USE_')) or name in {
-                'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CODE_SUBAGENT_MODEL'}:
+                'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CODE_SUBAGENT_MODEL', 'OPENROUTER_API_KEY'}:
             env.pop(name, None)
-    env.update(ANTHROPIC_BASE_URL=BASE_URL, ANTHROPIC_AUTH_TOKEN=key,
-               ANTHROPIC_API_KEY='', OPENROUTER_API_KEY=key,
-               CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY='1')
+    return env
+
+
+def launch_env(key, model, parent=None, provider=PROVIDER_OPENROUTER, base_url=BASE_URL):
+    if is_batch_model(model):
+        raise ValueError('Batch-only models cannot run an interactive Claude session. Select the model without :batch.')
+    env = clean_launch_env(parent)
+    if provider == PROVIDER_OLLAMA:
+        url = normalize_base_url(base_url or OLLAMA_BASE_URL)
+        env.update(ANTHROPIC_BASE_URL=url, ANTHROPIC_AUTH_TOKEN=key or 'ollama',
+                   ANTHROPIC_API_KEY='', CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY='1')
+    else:
+        env.update(ANTHROPIC_BASE_URL=BASE_URL, ANTHROPIC_AUTH_TOKEN=key,
+                   ANTHROPIC_API_KEY='', OPENROUTER_API_KEY=key,
+                   CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY='1')
     if model.strip():
         env['ANTHROPIC_MODEL'] = model.strip()
     return env
+
+
+def normalize_base_url(value):
+    url = (value or '').strip().rstrip('/')
+    if not url:
+        raise ValueError('Enter a base URL.')
+    if not (url.startswith('http://') or url.startswith('https://')):
+        raise ValueError('Base URL must start with http:// or https://')
+    if any(c.isspace() for c in url):
+        raise ValueError('Base URL cannot contain spaces.')
+    return url
 
 
 def settings_conflicts(project):
@@ -116,6 +141,30 @@ def normalize_models(payload):
     return sorted(models.values(), key=lambda row: row['id'].casefold())
 
 
+
+def normalize_ollama_models(payload):
+    rows = payload.get('models') if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError('Invalid Ollama model response')
+    models = {}
+    for row in rows:
+        if isinstance(row, dict) and isinstance(row.get('name'), str) and row['name']:
+            name = row['name']
+            details = row.get('details') or {}
+            models[name] = {'id': name, 'name': name, 'provider': 'ollama',
+                            'modified_at': row.get('modified_at'),
+                            'size': row.get('size'),
+                            'family': details.get('family'),
+                            'supported_parameters': []}
+    if not models:
+        raise ValueError('No local Ollama models were found')
+    return sorted(models.values(), key=lambda row: row['id'].casefold())
+
+
+def catalog_provider(row):
+    return row.get('provider') or row['id'].split('/')[0]
+
+
 def numeric(value):
     try:
         result = Decimal(str(value))
@@ -134,7 +183,7 @@ def filter_models(models, search='', claude_only=True, tools_only=False,
             if not is_batch_model(row['id'])
             and (not claude_only or row['id'].startswith('anthropic/claude-'))
             and (not tools_only or 'tools' in (row.get('supported_parameters') or []))
-            and (provider == 'All' or row['id'].split('/')[0] == provider)
+            and (provider == 'All' or catalog_provider(row) == provider)
             and (not free_only or (numeric((row.get('pricing') or {}).get('prompt')) == 0
                  and numeric((row.get('pricing') or {}).get('completion')) == 0
                  and numeric((row.get('pricing') or {}).get('request', '0')) == 0))
@@ -263,12 +312,13 @@ def model_price(value):
 class Manager(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title('Claude CLI • OpenRouter Key Manager')
+        self.title('Claude CLI • API Provider Manager')
         self.geometry('1000x850')
         self.minsize(800, 580)
         self.store = Path(os.getenv('LOCALAPPDATA', str(Path.home()))) / 'ClaudeOpenRouterManager/profiles.json'
         self.data = {'version': 1, 'keys': [], 'active': None, 'project': str(Path.home()),
-                     'cli': '', 'model': '', 'favorites': [], 'recent_models': [], 'model_tests': {},
+                     'cli': '', 'model': '', 'provider': PROVIDER_OPENROUTER, 'ollama_base_url': OLLAMA_BASE_URL,
+                     'favorites': [], 'recent_models': [], 'model_tests': {},
                      'alert_limits': {'daily': '', 'monthly': '', 'remaining': ''}, 'auto_usage': False}
         try:
             if self.store.exists():
@@ -288,7 +338,7 @@ class Manager(tk.Tk):
         self.usage_by_key = {}
         self.model_test_text = tk.StringVar(value='Model compatibility: Untested')
         self.usage_text = tk.StringVar(value='Usage not refreshed.')
-        self.usage_details = tk.StringVar(value='Activate a key and refresh usage.')
+        self.usage_details = tk.StringVar(value='Activate an OpenRouter key and refresh usage.')
         self.auto_usage = tk.BooleanVar(value=self.data['auto_usage'])
         self.alert_vars = {name: tk.StringVar(value=self.data['alert_limits'].get(name, ''))
                            for name in ('daily', 'monthly', 'remaining')}
@@ -307,22 +357,25 @@ class Manager(tk.Tk):
         self.project = tk.StringVar(value=self.data['project'])
         self.cli = tk.StringVar(value=self.data['cli'])
         self.model = tk.StringVar(value=self.data['model'])
+        self.provider = tk.StringVar(value=self.data.get('provider', PROVIDER_OPENROUTER))
+        self.ollama_base_url = tk.StringVar(value=self.data.get('ollama_base_url', OLLAMA_BASE_URL))
         self.status = tk.StringVar(value='Ready. Activate a key, select a project, then launch.')
         self.active_text = tk.StringVar()
         self.build()
         self.refresh()
         self.after(100, self.poll)
         self.model.trace_add('write', lambda *_: self.update_test_label())
+        self.provider.trace_add('write', lambda *_: self.refresh())
         self.after(60000, self.auto_refresh_usage)
         self.protocol('WM_DELETE_WINDOW', self.close)
 
     def build(self):
         outer = ttk.Frame(self, padding=20)
         outer.pack(fill='both', expand=True)
-        ttk.Label(outer, text='Claude CLI / OpenRouter', font=('Segoe UI', 20, 'bold')).pack(anchor='w')
-        ttk.Label(outer, text='Windows-encrypted keys • Project launcher • No external Python packages').pack(anchor='w', pady=(2, 15))
-        self.tree = ttk.Treeview(outer, columns=('name', 'key', 'state'), show='headings', height=8)
-        for column, title, width in [('name', 'Key name', 300), ('key', 'Masked key', 220), ('state', 'Status', 150)]:
+        ttk.Label(outer, text='Claude CLI / API Provider Manager', font=('Segoe UI', 20, 'bold')).pack(anchor='w')
+        ttk.Label(outer, text='OpenRouter keys • Ollama local models • Project launcher • No external Python packages').pack(anchor='w', pady=(2, 15))
+        self.tree = ttk.Treeview(outer, columns=('name', 'provider', 'key', 'state'), show='headings', height=8)
+        for column, title, width in [('name', 'Key name', 280), ('provider', 'Provider', 110), ('key', 'Masked key', 220), ('state', 'Status', 150)]:
             self.tree.heading(column, text=title)
             self.tree.column(column, width=width)
         self.tree.pack(fill='both', expand=True)
@@ -335,15 +388,19 @@ class Manager(tk.Tk):
         form = ttk.Frame(outer)
         form.pack(fill='x')
         form.columnconfigure(1, weight=1)
+        ttk.Label(form, text='Provider').grid(row=0, column=0, sticky='w', pady=5, padx=(0, 12))
+        ttk.Combobox(form, textvariable=self.provider, values=[PROVIDER_OPENROUTER, PROVIDER_OLLAMA], state='readonly', width=20).grid(row=0, column=1, sticky='w', pady=5)
         for row, (label, variable, browse) in enumerate([
             ('Project folder', self.project, self.browse_project),
             ('Claude executable', self.cli, self.browse_cli),
+            ('Provider base URL', self.ollama_base_url, None),
             ('Model (optional)', self.model, None)]):
-            ttk.Label(form, text=label).grid(row=row, column=0, sticky='w', pady=5, padx=(0, 12))
-            ttk.Entry(form, textvariable=variable).grid(row=row, column=1, sticky='ew', pady=5)
+            gui_row = row + 1
+            ttk.Label(form, text=label).grid(row=gui_row, column=0, sticky='w', pady=5, padx=(0, 12))
+            ttk.Entry(form, textvariable=variable).grid(row=gui_row, column=1, sticky='ew', pady=5)
             if browse:
-                ttk.Button(form, text='Browse…', command=browse).grid(row=row, column=2, padx=(8, 0))
-        ttk.Label(outer, text='Leave executable blank for auto-detection. Leave model blank to use Claude’s model picker.').pack(anchor='w', pady=5)
+                ttk.Button(form, text='Browse…', command=browse).grid(row=gui_row, column=2, padx=(8, 0))
+        ttk.Label(outer, text='Use OpenRouter for API keys and catalog/usage. Use Ollama for local model discovery; Claude CLI requires the configured base URL to accept Anthropic Messages requests.').pack(anchor='w', pady=5)
         model_actions = ttk.Frame(outer)
         model_actions.pack(fill='x', pady=4)
         self.fetch_button = ttk.Button(model_actions, text='Fetch Models', command=lambda: self.safe(self.fetch_models))
@@ -357,7 +414,7 @@ class Manager(tk.Tk):
         ttk.Label(test_actions, textvariable=self.model_test_text).pack(side='left', padx=10)
         usage = ttk.Frame(outer)
         usage.pack(fill='x', pady=4)
-        ttk.Button(usage, text='Usage & spending', command=lambda: self.safe(self.show_usage)).pack(side='left')
+        ttk.Button(usage, text='OpenRouter usage & spending', command=lambda: self.safe(self.show_usage)).pack(side='left')
         ttk.Label(usage, textvariable=self.usage_text, wraplength=700).pack(side='left', padx=10)
         actions = ttk.Frame(outer)
         actions.pack(fill='x', pady=10)
@@ -380,6 +437,7 @@ class Manager(tk.Tk):
             if value and (numeric(value) is None or numeric(value) < 0):
                 raise ValueError('Spending thresholds must be nonnegative numbers, or blank to disable.')
         self.data.update(project=self.project.get(), cli=self.cli.get(), model=self.model.get(),
+                         provider=self.provider.get(), ollama_base_url=self.ollama_base_url.get().strip() or OLLAMA_BASE_URL,
                          alert_limits=limits, auto_usage=self.auto_usage.get())
         atomic_json(self.store, self.data)
         self.status.set('Preferences saved.')
@@ -388,12 +446,12 @@ class Manager(tk.Tk):
         selected = self.tree.selection()
         self.tree.delete(*self.tree.get_children())
         for item in self.data['keys']:
-            self.tree.insert('', 'end', iid=item['id'], values=(item['name'], item['mask'],
+            self.tree.insert('', 'end', iid=item['id'], values=(item['name'], PROVIDER_LABELS.get(item.get('provider', PROVIDER_OPENROUTER), item.get('provider', '')), item['mask'],
                              'ACTIVE' if item['id'] == self.data['active'] else 'Inactive'))
         if selected and self.tree.exists(selected[0]):
             self.tree.selection_set(selected[0])
         active = next((x for x in self.data['keys'] if x['id'] == self.data['active']), None)
-        self.active_text.set('Active key: ' + (active['name'] if active else 'None'))
+        self.active_text.set('Active OpenRouter key: ' + (active['name'] if active else 'None') + ' • Launch provider: ' + PROVIDER_LABELS.get(self.provider.get(), self.provider.get()))
         self.update_test_label()
         self.render_usage()
         if self.model_browser_refresh:
@@ -433,6 +491,7 @@ class Manager(tk.Tk):
                     raise ValueError('Enter an API key.')
                 record = dict(item) if item else {'id': str(uuid.uuid4())}
                 record['name'] = title
+                record['provider'] = PROVIDER_OPENROUTER
                 if token:
                     record.update(secret=protect(token), mask='sk-or-…' + token[-4:])
                 old = json.loads(json.dumps(self.data))
@@ -476,13 +535,13 @@ class Manager(tk.Tk):
         self.data['active'] = item['id']
         self.save()
         self.refresh()
-        self.status.set('Key activated for future launches.')
+        self.status.set('OpenRouter key activated for future OpenRouter launches.')
 
     def deactivate(self):
         self.data['active'] = None
         self.save()
         self.refresh()
-        self.status.set('Deactivated. Launch is disabled until a key is activated.')
+        self.status.set('OpenRouter key deactivated. Ollama launches do not require an OpenRouter key.')
 
     def test(self):
         item = self.selected()
@@ -532,12 +591,27 @@ class Manager(tk.Tk):
     def fetch_models(self):
         if self.fetching_models:
             return
-        # The catalog is public; use the active key if one is selected.
-        active = next((x for x in self.data['keys'] if x['id'] == self.data['active']), None)
-        token = protect(active['secret'], decrypt=True) if active else None
+        provider = self.provider.get()
         self.fetching_models = True
         self.fetch_button.configure(state='disabled')
-        self.status.set('Fetching OpenRouter models…')
+        self.status.set('Fetching ' + PROVIDER_LABELS.get(provider, provider) + ' models…')
+        if provider == PROVIDER_OLLAMA:
+            base_url = normalize_base_url(self.ollama_base_url.get() or OLLAMA_BASE_URL)
+            def worker():
+                try:
+                    request = urllib.request.Request(base_url + '/api/tags', headers={'Accept': 'application/json'})
+                    with urllib.request.urlopen(request, timeout=10) as response:
+                        models = normalize_ollama_models(json.loads(response.read()))
+                    self.events.put(('models', models, datetime.now().astimezone().strftime('%m-%d-%y %I:%M %p %Z')))
+                except urllib.error.HTTPError as exc:
+                    self.events.put(('error', f'Ollama model fetch failed: HTTP {exc.code}. Check the local Ollama service.'))
+                except Exception:
+                    self.events.put(('error', 'Ollama model fetch failed. Start Ollama and verify the base URL.'))
+            threading.Thread(target=worker, daemon=True).start()
+            return
+        # The OpenRouter catalog is public; use the active key if one is selected.
+        active = next((x for x in self.data['keys'] if x['id'] == self.data['active']), None)
+        token = protect(active['secret'], decrypt=True) if active else None
         def worker():
             try:
                 headers = {'Accept': 'application/json'}
@@ -556,7 +630,7 @@ class Manager(tk.Tk):
     def active_key(self):
         item = next((x for x in self.data['keys'] if x['id'] == self.data['active']), None)
         if not item:
-            raise ValueError('Activate an API key first.')
+            raise ValueError('Activate an OpenRouter API key first.')
         return item
 
     def credential_revision(self, item):
@@ -584,6 +658,8 @@ class Manager(tk.Tk):
         model = model or self.model.get().strip()
         if not model or is_batch_model(model):
             raise ValueError('Select an interactive model first.')
+        if self.provider.get() == PROVIDER_OLLAMA:
+            raise ValueError('Model compatibility probes currently use OpenRouter. For Ollama, test by launching Claude CLI against an Anthropic-compatible local endpoint.')
         item = self.active_key()
         if not messagebox.askyesno('Run paid compatibility test?',
                 'This sends up to three small model requests through OpenRouter and may incur API charges. '
@@ -693,7 +769,7 @@ class Manager(tk.Tk):
         snapshot = self.usage_by_key.get(item['id']) if item else None
         if not snapshot or snapshot.get('revision') != self.credential_revision(item):
             self.usage_text.set('Usage not refreshed for the active key.')
-            self.usage_details.set('Activate a key and click Refresh usage.')
+            self.usage_details.set('Activate an OpenRouter key and click Refresh usage.')
             return
         key = snapshot['key']
         remaining = money(key.get('limit_remaining'), 'No key cap' if key.get('limit') is None else 'Unavailable')
@@ -752,13 +828,13 @@ class Manager(tk.Tk):
             self.model_window.lift()
             return
         window = self.model_window = tk.Toplevel(self)
-        window.title('OpenRouter model browser')
+        window.title(PROVIDER_LABELS.get(self.provider.get(), self.provider.get()) + ' model browser')
         window.geometry('1250x650')
         window.minsize(950, 500)
         frame = ttk.Frame(window, padding=15)
         frame.pack(fill='both', expand=True)
         search = tk.StringVar()
-        claude_only = tk.BooleanVar(value=True)
+        claude_only = tk.BooleanVar(value=self.provider.get() != PROVIDER_OLLAMA)
         tools_only = tk.BooleanVar(value=False)
         free_only = tk.BooleanVar(value=False)
         provider = tk.StringVar(value='All')
@@ -774,7 +850,7 @@ class Manager(tk.Tk):
         second = ttk.Frame(frame)
         second.pack(fill='x', pady=(0, 10))
         for label, var, values, width in [
-            ('Provider', provider, ['All'] + sorted({r['id'].split('/')[0] for r in self.models}), 18),
+            ('Provider', provider, ['All'] + sorted({catalog_provider(r) for r in self.models}), 18),
             ('View', view, ['All', 'Favorites', 'Recent'], 14),
             ('Sort', sort, ['Model ID', 'Name', 'Input price: low to high', 'Output price: low to high', 'Context: high to low'], 28)]:
             ttk.Label(second, text=label).pack(side='left', padx=(0, 5))
@@ -834,7 +910,7 @@ class Manager(tk.Tk):
         def choose(_event=None):
             try:
                 model = selected()
-                if not model.startswith('anthropic/claude-') and not messagebox.askyesno('Model compatibility',
+                if self.provider.get() != PROVIDER_OLLAMA and not model.startswith('anthropic/claude-') and not messagebox.askyesno('Model compatibility',
                     'Other providers may not fully work with Claude Code. Select this model anyway?', parent=window):
                     return
                 self.model.set(model)
@@ -855,7 +931,7 @@ class Manager(tk.Tk):
         table.bind('<Double-1>', choose)
         table.bind('<Return>', choose)
         ttk.Label(frame, textvariable=count).pack(anchor='w', pady=8)
-        ttk.Label(frame, text='Prices are catalog estimates. Free means listed text input/output and request price are zero; other fees can apply. API probe results apply to the active key and do not guarantee full CLI compatibility.', wraplength=1200).pack(anchor='w')
+        ttk.Label(frame, text='OpenRouter prices are catalog estimates. Ollama rows are local models with no OpenRouter price. API probe results apply to OpenRouter active keys. Claude CLI with Ollama needs an Anthropic-compatible local endpoint.', wraplength=1200).pack(anchor='w')
         bottom = ttk.Frame(frame)
         bottom.pack(fill='x', pady=10)
         ttk.Button(bottom, text='Use selected model', command=choose).pack(side='left')
@@ -877,9 +953,10 @@ class Manager(tk.Tk):
     def launch(self):
         if is_batch_model(self.model.get()):
             raise ValueError('The saved model is batch-only. Fetch Models and select its version without :batch before launching.')
+        provider = self.provider.get()
         item = next((x for x in self.data['keys'] if x['id'] == self.data['active']), None)
-        if not item:
-            raise ValueError('Activate an API key before launching.')
+        if provider == PROVIDER_OPENROUTER and not item:
+            raise ValueError('Activate an OpenRouter API key before launching.')
         project = Path(self.project.get()).expanduser().resolve()
         if not project.is_dir():
             raise ValueError('Select an existing project folder.')
@@ -900,7 +977,8 @@ class Manager(tk.Tk):
             raise ValueError('Executable path contains shell characters. Install Claude in a simple path.')
         if Path(binary).suffix.lower() not in {'.exe', '.cmd', '.bat'}:
             raise ValueError('Choose a Windows executable, CMD, or BAT file.')
-        env = launch_env(protect(item['secret'], decrypt=True), self.model.get())
+        token = protect(item['secret'], decrypt=True) if item else ''
+        env = launch_env(token, self.model.get(), provider=provider, base_url=self.ollama_base_url.get())
         self.save()
         if Path(binary).suffix.lower() == '.exe':
             subprocess.Popen([binary], cwd=str(project), env=env, creationflags=subprocess.CREATE_NEW_CONSOLE)
@@ -912,7 +990,7 @@ class Manager(tk.Tk):
         if chosen:
             self.data['recent_models'] = [chosen] + [r for r in self.data['recent_models'] if r != chosen][:19]
             self.save()
-        self.status.set('Claude launched. Run /status inside its terminal to verify OpenRouter routing.')
+        self.status.set('Claude launched. Run /status inside its terminal to verify provider routing.')
 
     def help(self):
         messagebox.showinfo('Help', '1. Install Python 3.10+ and Claude Code on Windows.\n'
