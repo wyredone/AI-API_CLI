@@ -41,3 +41,21 @@ Existing keys and preferences are retained in the same Windows profile location.
 
 Model listing endpoint: https://openrouter.ai/api/v1/models
 Documentation: https://openrouter.ai/docs/quickstart
+
+## Compatibility tests, browser upgrades, and usage
+
+1. **Test selected model** checks OpenRouter's Anthropic Messages endpoint with a text response, a forced harmless tool call, and a tool-result round trip. It makes up to three small requests and asks you to approve potential API charges before starting. No commands or files are accessed. Results are saved per key and model as Passed, Failed or Untested. Replacing a key invalidates its old test results. A passed probe does not guarantee complete Claude CLI compatibility; streaming, reasoning, context limits and Claude's other tool types are not tested.
+2. **Model browser** now supports favorites, twenty recent selections, provider filters, free-model and tool-support filters, and sorting by price or context length. Clear Claude only when viewing other providers. Batch-only models remain excluded. Prices are catalog estimates; zero text prices do not exclude other applicable fees.
+3. **Usage & spending** reads the active key's daily, weekly, monthly and all-time OpenRouter usage, key spending cap and remaining cap. BYOK usage is displayed separately. Periods are OpenRouter's UTC periods. These are API snapshots, not live per-terminal totals.
+4. Account balance is requested separately from the credits endpoint. If access is unavailable (management-key permissions may be required), the app says Unavailable. An unlimited key cap is not an unlimited account balance.
+5. Set optional daily/monthly usage or remaining-key-cap alert thresholds, then click Save alerts. Blank or zero disables a threshold. Auto-refresh runs every sixty seconds only while the GUI remains open. Refresh intervals can be longer when a request is still running. Alerts do not block charges or enforce limits. Use the Key spending caps link for OpenRouter's hard caps.
+6. The OpenRouter activity link opens the usage dashboard in your browser. Cached usage is marked stale after a refresh failure; last successful model catalog remains available offline.
+
+Run offline regression tests from the project folder with `python -m unittest -v test_app`.
+
+Validation: the offline tests cover catalog filtering/sorting, pricing, complete mocked tool round trips, failure states, credential-change invalidation, API error redaction, and spending alert boundaries. Windows GUI, DPAPI and real OpenRouter model requests require verification on your PC.
+
+Official sources:
+- https://openrouter.ai/docs/api/api-reference/anthropic-messages/create-messages
+- https://openrouter.ai/docs/api/api-reference/api-keys/get-current-key
+- https://openrouter.ai/docs/api/api-reference/credits/get-credits

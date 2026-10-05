@@ -17,6 +17,8 @@ from tkinter import ttk, filedialog, messagebox
 import urllib.request
 import urllib.error
 import uuid
+import hashlib
+import webbrowser
 
 BASE_URL = 'https://openrouter.ai/api'
 ENV_KEYS = {'ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY',
@@ -114,13 +116,138 @@ def normalize_models(payload):
     return sorted(models.values(), key=lambda row: row['id'].casefold())
 
 
-def filter_models(models, search='', claude_only=True, tools_only=False):
+def numeric(value):
+    try:
+        result = Decimal(str(value))
+        return result if result.is_finite() else None
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def filter_models(models, search='', claude_only=True, tools_only=False,
+                  provider='All', free_only=False, favorites=None,
+                  view='All', recent=None, sort='Model ID'):
     query = search.strip().casefold()
-    return [row for row in models
+    favorites = set(favorites or [])
+    recent = list(recent or [])
+    rows = [row for row in models
             if not is_batch_model(row['id'])
             and (not claude_only or row['id'].startswith('anthropic/claude-'))
             and (not tools_only or 'tools' in (row.get('supported_parameters') or []))
+            and (provider == 'All' or row['id'].split('/')[0] == provider)
+            and (not free_only or (numeric((row.get('pricing') or {}).get('prompt')) == 0
+                 and numeric((row.get('pricing') or {}).get('completion')) == 0
+                 and numeric((row.get('pricing') or {}).get('request', '0')) == 0))
+            and (view != 'Favorites' or row['id'] in favorites)
+            and (view != 'Recent' or row['id'] in recent)
             and (not query or query in (row['id'] + ' ' + str(row.get('name', ''))).casefold())]
+    def price_key(row, field):
+        price = numeric((row.get('pricing') or {}).get(field))
+        return price if price is not None and price >= 0 else Decimal('Infinity')
+    if sort == 'Input price: low to high':
+        rows.sort(key=lambda row: (price_key(row, 'prompt'), row['id']))
+    elif sort == 'Output price: low to high':
+        rows.sort(key=lambda row: (price_key(row, 'completion'), row['id']))
+    elif sort == 'Context: high to low':
+        rows.sort(key=lambda row: (-(numeric(row.get('context_length')) or 0), row['id']))
+    elif sort == 'Name':
+        rows.sort(key=lambda row: str(row.get('name', row['id'])).casefold())
+    elif view == 'Recent':
+        rows.sort(key=lambda row: recent.index(row['id']))
+    else:
+        rows.sort(key=lambda row: row['id'].casefold())
+    return rows
+
+
+def api_request(token, path, body=None):
+    headers = {'Authorization': 'Bearer ' + token, 'Accept': 'application/json',
+               'anthropic-version': '2023-06-01'}
+    if body is not None:
+        headers['Content-Type'] = 'application/json'
+    request = urllib.request.Request(BASE_URL + '/v1/' + path, headers=headers,
+        data=json.dumps(body).encode('utf-8') if body is not None else None)
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            result = json.loads(response.read())
+        if not isinstance(result, dict) or result.get('error'):
+            raise ValueError('Invalid API response')
+        return result
+    except urllib.error.HTTPError as exc:
+        descriptions = {401: 'Invalid or expired key', 402: 'Credit or spending limit reached',
+                        403: 'Access denied', 404: 'Model or endpoint unavailable',
+                        429: 'Rate limited'}
+        raise RuntimeError(f'HTTP {exc.code}: ' + descriptions.get(exc.code, 'Request rejected')) from None
+    except Exception:
+        raise RuntimeError('Network error or invalid API response') from None
+
+
+def probe_model(token, model):
+    if not model or is_batch_model(model):
+        raise ValueError('Select an interactive model first.')
+    timestamp = datetime.now().astimezone().isoformat(timespec='seconds')
+    result = {'status': 'Failed', 'response': 'Untested', 'tools': 'Untested',
+              'round_trip': 'Untested', 'checked_at': timestamp, 'detail': ''}
+    stage = 'response'
+    try:
+        plain = api_request(token, 'messages', {'model': model, 'max_tokens': 256,
+            'messages': [{'role': 'user', 'content': 'Reply with only CHECK_OK.'}]})
+        blocks = plain.get('content', [])
+        if not isinstance(blocks, list) or not any(b.get('type') == 'text' and b.get('text', '').strip()
+                                                  for b in blocks if isinstance(b, dict)):
+            raise ValueError('No text response received.')
+        result['response'] = 'Passed'
+        stage = 'tools'
+        nonce = uuid.uuid4().hex[:12]
+        user = {'role': 'user', 'content': 'Call compatibility_ping with token ' + nonce + '.'}
+        tool = {'name': 'compatibility_ping', 'description': 'A harmless compatibility check; no commands or file access.',
+                'input_schema': {'type': 'object', 'properties': {'token': {'type': 'string', 'enum': [nonce]}},
+                                 'required': ['token'], 'additionalProperties': False}}
+        called = api_request(token, 'messages', {'model': model, 'max_tokens': 256,
+            'messages': [user], 'tools': [tool],
+            'tool_choice': {'type': 'tool', 'name': 'compatibility_ping'}})
+        content = called.get('content', [])
+        uses = [b for b in content if isinstance(b, dict) and b.get('type') == 'tool_use'
+                and b.get('name') == 'compatibility_ping' and b.get('id')
+                and b.get('input') == {'token': nonce}] if isinstance(content, list) else []
+        if len(uses) != 1:
+            result['tools'] = 'Failed'
+            raise ValueError('Expected tool call and arguments were not returned.')
+        result['tools'] = 'Passed'
+        stage = 'round_trip'
+        finish = api_request(token, 'messages', {'model': model, 'max_tokens': 256,
+            'tools': [tool], 'tool_choice': {'type': 'none'}, 'messages': [user,
+                {'role': 'assistant', 'content': content},
+                {'role': 'user', 'content': [
+                    {'type': 'tool_result', 'tool_use_id': uses[0]['id'], 'content': 'PROBE_OK_' + nonce},
+                    {'type': 'text', 'text': 'Reply with the exact PROBE_OK token returned by the tool.'}]}]})
+        text = ' '.join(b.get('text', '') for b in finish.get('content', [])
+                        if isinstance(b, dict) and b.get('type') == 'text')
+        if 'PROBE_OK_' + nonce not in text:
+            result['round_trip'] = 'Failed'
+            raise ValueError('Tool result was not acknowledged correctly.')
+        result.update(status='Passed', round_trip='Passed',
+                      detail='Anthropic Messages response, forced tool call and tool-result round trip passed. Full Claude CLI compatibility is not guaranteed.')
+    except Exception as exc:
+        result[stage] = 'Failed'
+        result['detail'] = str(exc) if isinstance(exc, (RuntimeError, ValueError)) else 'Probe failed.'
+    return result
+
+
+def spending_alerts(key_info, limits):
+    alerts = []
+    for field, threshold, label, lower in [
+        ('usage_daily', 'daily', 'UTC daily key usage', False),
+        ('usage_monthly', 'monthly', 'UTC monthly key usage', False),
+        ('limit_remaining', 'remaining', 'Key cap remaining', True)]:
+        value, limit = numeric(key_info.get(field)), numeric(limits.get(threshold))
+        if value is not None and limit is not None and limit > 0 and ((value <= limit) if lower else (value >= limit)):
+            alerts.append(f'{label}: ${value:,.2f} (alert threshold ${limit:,.2f})')
+    return alerts
+
+
+def money(value, absent='Unavailable'):
+    parsed = numeric(value)
+    return f'${parsed:,.2f}' if parsed is not None else absent
 
 
 def model_price(value):
@@ -137,11 +264,12 @@ class Manager(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title('Claude CLI • OpenRouter Key Manager')
-        self.geometry('960x710')
+        self.geometry('1000x850')
         self.minsize(800, 580)
         self.store = Path(os.getenv('LOCALAPPDATA', str(Path.home()))) / 'ClaudeOpenRouterManager/profiles.json'
         self.data = {'version': 1, 'keys': [], 'active': None, 'project': str(Path.home()),
-                     'cli': '', 'model': ''}
+                     'cli': '', 'model': '', 'favorites': [], 'recent_models': [], 'model_tests': {},
+                     'alert_limits': {'daily': '', 'monthly': '', 'remaining': ''}, 'auto_usage': False}
         try:
             if self.store.exists():
                 loaded = json.loads(self.store.read_text(encoding='utf-8'))
@@ -153,6 +281,18 @@ class Manager(tk.Tk):
             self.destroy()
             raise SystemExit(1)
         self.events = queue.Queue()
+        self.testing_model = False
+        self.usage_busy = False
+        self.usage_window = None
+        self.model_browser_refresh = None
+        self.usage_by_key = {}
+        self.model_test_text = tk.StringVar(value='Model compatibility: Untested')
+        self.usage_text = tk.StringVar(value='Usage not refreshed.')
+        self.usage_details = tk.StringVar(value='Activate a key and refresh usage.')
+        self.auto_usage = tk.BooleanVar(value=self.data['auto_usage'])
+        self.alert_vars = {name: tk.StringVar(value=self.data['alert_limits'].get(name, ''))
+                           for name in ('daily', 'monthly', 'remaining')}
+        self.alert_notified = set()
         self.models = []
         self.models_fetched = ''
         self.model_window = None
@@ -172,6 +312,8 @@ class Manager(tk.Tk):
         self.build()
         self.refresh()
         self.after(100, self.poll)
+        self.model.trace_add('write', lambda *_: self.update_test_label())
+        self.after(60000, self.auto_refresh_usage)
         self.protocol('WM_DELETE_WINDOW', self.close)
 
     def build(self):
@@ -208,6 +350,15 @@ class Manager(tk.Tk):
         self.fetch_button.pack(side='left')
         ttk.Button(model_actions, text='Browse cached models', command=lambda: self.safe(self.show_models)).pack(side='left', padx=8)
         ttk.Button(model_actions, text='Clear model selection', command=lambda: self.model.set('')).pack(side='left')
+        test_actions = ttk.Frame(outer)
+        test_actions.pack(fill='x', pady=4)
+        self.test_model_button = ttk.Button(test_actions, text='Test selected model', command=lambda: self.safe(self.test_model))
+        self.test_model_button.pack(side='left')
+        ttk.Label(test_actions, textvariable=self.model_test_text).pack(side='left', padx=10)
+        usage = ttk.Frame(outer)
+        usage.pack(fill='x', pady=4)
+        ttk.Button(usage, text='Usage & spending', command=lambda: self.safe(self.show_usage)).pack(side='left')
+        ttk.Label(usage, textvariable=self.usage_text, wraplength=700).pack(side='left', padx=10)
         actions = ttk.Frame(outer)
         actions.pack(fill='x', pady=10)
         ttk.Button(actions, text='Launch Claude CLI', command=lambda: self.safe(self.launch)).pack(side='left')
@@ -224,7 +375,12 @@ class Manager(tk.Tk):
             messagebox.showerror('Action failed', str(exc))
 
     def save(self):
-        self.data.update(project=self.project.get(), cli=self.cli.get(), model=self.model.get())
+        limits = {name: var.get().strip() for name, var in self.alert_vars.items()}
+        for value in limits.values():
+            if value and (numeric(value) is None or numeric(value) < 0):
+                raise ValueError('Spending thresholds must be nonnegative numbers, or blank to disable.')
+        self.data.update(project=self.project.get(), cli=self.cli.get(), model=self.model.get(),
+                         alert_limits=limits, auto_usage=self.auto_usage.get())
         atomic_json(self.store, self.data)
         self.status.set('Preferences saved.')
 
@@ -238,6 +394,10 @@ class Manager(tk.Tk):
             self.tree.selection_set(selected[0])
         active = next((x for x in self.data['keys'] if x['id'] == self.data['active']), None)
         self.active_text.set('Active key: ' + (active['name'] if active else 'None'))
+        self.update_test_label()
+        self.render_usage()
+        if self.model_browser_refresh:
+            self.model_browser_refresh()
 
     def selected(self):
         selection = self.tree.selection()
@@ -303,6 +463,8 @@ class Manager(tk.Tk):
         item = self.selected()
         if messagebox.askyesno('Remove saved key', f'Remove "{item["name"]}" from this manager?\nThis does not revoke the key at OpenRouter.'):
             self.data['keys'].remove(item)
+            self.data['model_tests'].pop(item['id'], None)
+            self.usage_by_key.pop(item['id'], None)
             if self.data['active'] == item['id']:
                 self.data['active'] = None
             self.save()
@@ -344,6 +506,9 @@ class Manager(tk.Tk):
             while True:
                 event = self.events.get_nowait()
                 if isinstance(event, tuple):
+                    if event[0] in {'probe', 'usage', 'usage_error'}:
+                        self.handle_feature_event(event)
+                        continue
                     self.fetching_models = False
                     self.fetch_button.configure(state='normal')
                     if event[0] == 'models':
@@ -388,38 +553,240 @@ class Manager(tk.Tk):
                 self.events.put(('error', 'Model fetch failed: network or catalog response error.'))
         threading.Thread(target=worker, daemon=True).start()
 
+    def active_key(self):
+        item = next((x for x in self.data['keys'] if x['id'] == self.data['active']), None)
+        if not item:
+            raise ValueError('Activate an API key first.')
+        return item
+
+    def credential_revision(self, item):
+        return hashlib.sha256(item['secret'].encode()).hexdigest()
+
+    def test_result(self, model):
+        item = next((x for x in self.data['keys'] if x['id'] == self.data['active']), None)
+        if not item:
+            return None
+        result = self.data['model_tests'].get(item['id'], {}).get(model)
+        if result and result.get('revision') == self.credential_revision(item):
+            return result
+        return None
+
+    def update_test_label(self):
+        result = self.test_result(self.model.get().strip())
+        text = 'Model compatibility: ' + (result['status'] if result else 'Untested')
+        if result:
+            text += ' • Checked ' + result.get('checked_at', '')
+        self.model_test_text.set(text)
+
+    def test_model(self, model=None):
+        if self.testing_model:
+            return
+        model = model or self.model.get().strip()
+        if not model or is_batch_model(model):
+            raise ValueError('Select an interactive model first.')
+        item = self.active_key()
+        if not messagebox.askyesno('Run paid compatibility test?',
+                'This sends up to three small model requests through OpenRouter and may incur API charges. '
+                'It tests text response, tool calling and tool-result handling, without running commands.\n\n'
+                'Model: ' + model + '\nProceed?'):
+            return
+        token = protect(item['secret'], decrypt=True)
+        key_id, revision = item['id'], self.credential_revision(item)
+        self.testing_model = True
+        self.test_model_button.configure(state='disabled')
+        self.status.set('Testing model response and tool handling…')
+        def worker():
+            result = probe_model(token, model)
+            result['revision'] = revision
+            self.events.put(('probe', key_id, model, result))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def handle_feature_event(self, event):
+        if event[0] == 'probe':
+            self.testing_model = False
+            self.test_model_button.configure(state='normal')
+            _, key_id, model, result = event
+            item = next((x for x in self.data['keys'] if x['id'] == key_id), None)
+            if item is None or self.credential_revision(item) != result['revision']:
+                self.status.set('Test result discarded because its key was removed or changed.')
+                return
+            self.data['model_tests'].setdefault(key_id, {})[model] = result
+            try:
+                self.save()
+            except Exception:
+                self.status.set('Test completed but its result could not be saved.')
+            self.update_test_label()
+            if self.model_browser_refresh:
+                self.model_browser_refresh()
+            messagebox.showinfo('Model probe: ' + result['status'],
+                model + '\n\nText response: ' + result['response'] + '\nTool calling: ' + result['tools'] +
+                '\nTool-result handling: ' + result['round_trip'] + '\n\n' + result['detail'] +
+                '\n\nChecked: ' + result['checked_at'])
+        elif event[0] in {'usage', 'usage_error'}:
+            self.usage_busy = False
+            if event[0] == 'usage_error':
+                active = next((x for x in self.data['keys'] if x['id'] == self.data['active']), None)
+                if active and event[1] == active['id'] and event[2] == self.credential_revision(active):
+                    previous = self.usage_by_key.get(event[1])
+                    if previous:
+                        previous['stale'] = True
+                        self.render_usage()
+                    self.usage_text.set('Usage refresh failed; any displayed snapshot is stale.')
+                    self.status.set(event[3])
+                return
+            _, key_id, revision, snapshot = event
+            item = next((x for x in self.data['keys'] if x['id'] == key_id), None)
+            if item is None or self.credential_revision(item) != revision:
+                return
+            snapshot['revision'] = revision
+            self.usage_by_key[key_id] = snapshot
+            self.render_usage()
+            if key_id == self.data['active']:
+                alerts = spending_alerts(snapshot['key'], {k: v.get() for k, v in self.alert_vars.items()})
+                new_alerts = []
+                for alert in alerts:
+                    category = alert.split(':')[0]
+                    signature = (key_id, revision, snapshot['checked_at'][:10], category)
+                    if signature not in self.alert_notified:
+                        self.alert_notified.add(signature)
+                        new_alerts.append(alert)
+                if new_alerts:
+                    messagebox.showwarning('Spending alert', '\n'.join(new_alerts) +
+                        '\n\nThese are local alerts; they do not stop spending. Configure hard key caps on OpenRouter.')
+
+    def refresh_usage(self):
+        if self.usage_busy:
+            return
+        item = self.active_key()
+        token = protect(item['secret'], decrypt=True)
+        key_id, revision = item['id'], self.credential_revision(item)
+        self.usage_busy = True
+        self.usage_text.set('Refreshing usage…')
+        def worker():
+            try:
+                key = api_request(token, 'key').get('data')
+                if not isinstance(key, dict):
+                    raise ValueError('Key usage response is unavailable.')
+                balance = None
+                credit_note = 'Account balance unavailable: account credits may require a management key.'
+                try:
+                    credit = api_request(token, 'credits').get('data', {})
+                    total, used = numeric(credit.get('total_credits')), numeric(credit.get('total_usage'))
+                    if total is not None and used is not None:
+                        balance = str(total - used)
+                        credit_note = 'Account balance reported from purchased credits minus account usage.'
+                except Exception:
+                    pass
+                self.events.put(('usage', key_id, revision, {'key': key, 'balance': balance,
+                    'credit_note': credit_note, 'checked_at': datetime.now().astimezone().isoformat(timespec='seconds')}))
+            except Exception as exc:
+                self.events.put(('usage_error', key_id, revision, str(exc) if isinstance(exc, (RuntimeError, ValueError)) else 'Usage refresh failed.'))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def auto_refresh_usage(self):
+        if self.auto_usage.get() and self.data['active'] and not self.usage_busy:
+            self.safe(self.refresh_usage)
+        self.after(60000, self.auto_refresh_usage)
+
+    def render_usage(self):
+        item = next((x for x in self.data['keys'] if x['id'] == self.data['active']), None)
+        snapshot = self.usage_by_key.get(item['id']) if item else None
+        if not snapshot or snapshot.get('revision') != self.credential_revision(item):
+            self.usage_text.set('Usage not refreshed for the active key.')
+            self.usage_details.set('Activate a key and click Refresh usage.')
+            return
+        key = snapshot['key']
+        remaining = money(key.get('limit_remaining'), 'No key cap' if key.get('limit') is None else 'Unavailable')
+        self.usage_text.set('Daily: ' + money(key.get('usage_daily')) + ' • Monthly: ' + money(key.get('usage_monthly')) + ' • Key cap remaining: ' + remaining)
+        lines = ['Key: ' + item['name'], 'Snapshot: ' + snapshot['checked_at'] + (' (STALE: latest refresh failed)' if snapshot.get('stale') else ''),
+                 '', 'OpenRouter-reported key usage (USD):',
+                 'Current UTC day: ' + money(key.get('usage_daily')),
+                 'Current UTC week: ' + money(key.get('usage_weekly')),
+                 'Current UTC month: ' + money(key.get('usage_monthly')),
+                 'All time: ' + money(key.get('usage')),
+                 'BYOK all time (separate): ' + money(key.get('byok_usage')),
+                 '', 'Key spending cap: ' + money(key.get('limit'), 'No cap configured'),
+                 'Key cap remaining: ' + remaining,
+                 'Cap reset: ' + str(key.get('limit_reset') or 'No reset'),
+                 'BYOK included in cap: ' + ('Yes' if key.get('include_byok_in_limit') else 'No'),
+                 '', 'Account balance: ' + money(snapshot['balance']), snapshot['credit_note'],
+                 '', 'Usage is a fetched snapshot, not a live Claude session total. Periods are defined by OpenRouter in UTC.']
+        alerts = spending_alerts(key, {k: v.get() for k, v in self.alert_vars.items()})
+        if alerts:
+            lines += ['', 'ALERTS:'] + alerts
+        self.usage_details.set('\n'.join(lines))
+
+    def show_usage(self):
+        if self.usage_window is not None and self.usage_window.winfo_exists():
+            self.usage_window.lift()
+            return
+        window = self.usage_window = tk.Toplevel(self)
+        window.title('OpenRouter usage and spending')
+        window.geometry('850x700')
+        frame = ttk.Frame(window, padding=20)
+        frame.pack(fill='both', expand=True)
+        ttk.Label(frame, textvariable=self.usage_details, justify='left', wraplength=800).pack(anchor='w')
+        limits = ttk.LabelFrame(frame, text='Local alert thresholds in USD (blank or 0 disables)', padding=10)
+        limits.pack(fill='x', pady=12)
+        for i, (key, label) in enumerate([('daily', 'Daily usage reaches'), ('monthly', 'Monthly usage reaches'),
+                                         ('remaining', 'Key cap remaining below')]):
+            ttk.Label(limits, text=label).grid(row=i, column=0, sticky='w', pady=3)
+            ttk.Entry(limits, textvariable=self.alert_vars[key], width=15).grid(row=i, column=1, padx=12)
+        ttk.Checkbutton(frame, text='Auto-refresh active key every 60 seconds while this app is open', variable=self.auto_usage).pack(anchor='w')
+        ttk.Label(frame, text='Alerts do not enforce spending limits. Set hard limits in OpenRouter key settings.', wraplength=800).pack(anchor='w', pady=8)
+        actions = ttk.Frame(frame)
+        actions.pack(fill='x', pady=8)
+        ttk.Button(actions, text='Refresh usage', command=lambda: self.safe(self.refresh_usage)).pack(side='left')
+        ttk.Button(actions, text='Save alerts', command=lambda: self.safe(self.save)).pack(side='left', padx=8)
+        ttk.Button(actions, text='OpenRouter activity', command=lambda: webbrowser.open('https://openrouter.ai/activity')).pack(side='left', padx=8)
+        ttk.Button(actions, text='Key spending caps', command=lambda: webbrowser.open('https://openrouter.ai/settings/keys')).pack(side='left')
+        self.render_usage()
+        if self.data['active']:
+            self.safe(self.refresh_usage)
+
     def show_models(self):
         if not self.models:
-            messagebox.showinfo('No model catalog', 'Click Fetch Models first. An API key is not required to browse the public catalog.')
+            messagebox.showinfo('No model catalog', 'Click Fetch Models first.')
             return
         if self.model_window is not None and self.model_window.winfo_exists():
             self.model_window.lift()
             return
         window = self.model_window = tk.Toplevel(self)
         window.title('OpenRouter model browser')
-        window.geometry('1080x560')
-        window.minsize(850, 420)
-        window.transient(self)
+        window.geometry('1250x650')
+        window.minsize(950, 500)
         frame = ttk.Frame(window, padding=15)
         frame.pack(fill='both', expand=True)
         search = tk.StringVar()
         claude_only = tk.BooleanVar(value=True)
         tools_only = tk.BooleanVar(value=False)
+        free_only = tk.BooleanVar(value=False)
+        provider = tk.StringVar(value='All')
+        view = tk.StringVar(value='All')
+        sort = tk.StringVar(value='Model ID')
         count = tk.StringVar()
         filters = ttk.Frame(frame)
-        filters.pack(fill='x', pady=(0, 10))
+        filters.pack(fill='x', pady=(0, 8))
         ttk.Label(filters, text='Search').pack(side='left')
         ttk.Entry(filters, textvariable=search, width=35).pack(side='left', padx=8)
-        ttk.Checkbutton(filters, text='Claude models only', variable=claude_only).pack(side='left', padx=8)
-        ttk.Checkbutton(filters, text='Tool calling', variable=tools_only).pack(side='left', padx=8)
+        for label, var in [('Claude only', claude_only), ('Tool calling', tools_only), ('Free only', free_only)]:
+            ttk.Checkbutton(filters, text=label, variable=var).pack(side='left', padx=8)
+        second = ttk.Frame(frame)
+        second.pack(fill='x', pady=(0, 10))
+        for label, var, values, width in [
+            ('Provider', provider, ['All'] + sorted({r['id'].split('/')[0] for r in self.models}), 18),
+            ('View', view, ['All', 'Favorites', 'Recent'], 14),
+            ('Sort', sort, ['Model ID', 'Name', 'Input price: low to high', 'Output price: low to high', 'Context: high to low'], 28)]:
+            ttk.Label(second, text=label).pack(side='left', padx=(0, 5))
+            ttk.Combobox(second, textvariable=var, values=values, state='readonly', width=width).pack(side='left', padx=(0, 15))
         table_frame = ttk.Frame(frame)
         table_frame.pack(fill='both', expand=True)
-        table = ttk.Treeview(table_frame, columns=('id', 'name', 'context', 'input', 'output', 'tools'), show='headings')
-        for col, title, width in [('id', 'Model ID', 280), ('name', 'Name', 240),
-                ('context', 'Context tokens', 110), ('input', 'Input / 1M', 100),
-                ('output', 'Output / 1M', 100), ('tools', 'Tools', 65)]:
+        table = ttk.Treeview(table_frame, columns=('favorite', 'id', 'name', 'context', 'input', 'output', 'tools', 'test'), show='headings')
+        for col, title, width in [('favorite', 'Fav', 45), ('id', 'Model ID', 280), ('name', 'Name', 230),
+                ('context', 'Context', 90), ('input', 'Input / 1M', 95), ('output', 'Output / 1M', 95),
+                ('tools', 'Tools', 55), ('test', 'API probe', 90)]:
             table.heading(col, text=title)
-            table.column(col, width=width, minwidth=50)
+            table.column(col, width=width, minwidth=40)
         vertical = ttk.Scrollbar(table_frame, orient='vertical', command=table.yview)
         horizontal = ttk.Scrollbar(table_frame, orient='horizontal', command=table.xview)
         table.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
@@ -429,43 +796,72 @@ class Manager(tk.Tk):
         table_frame.rowconfigure(0, weight=1)
         table_frame.columnconfigure(0, weight=1)
         def update(*_):
-            rows = filter_models(self.models, search.get(), claude_only.get(), tools_only.get())
+            if not window.winfo_exists():
+                return
+            old = table.selection()
+            rows = filter_models(self.models, search.get(), claude_only.get(), tools_only.get(),
+                                 provider.get(), free_only.get(), self.data['favorites'], view.get(),
+                                 self.data['recent_models'], sort.get())
             table.delete(*table.get_children())
             for row in rows:
                 pricing = row.get('pricing') or {}
                 context = row.get('context_length')
-                table.insert('', 'end', iid=row['id'], values=(row['id'], row.get('name', ''),
+                test = self.test_result(row['id'])
+                table.insert('', 'end', iid=row['id'], values=(
+                    '★' if row['id'] in self.data['favorites'] else '', row['id'], row.get('name', ''),
                     f'{context:,}' if isinstance(context, int) else 'N/A',
                     model_price(pricing.get('prompt')), model_price(pricing.get('completion')),
-                    'Yes' if 'tools' in (row.get('supported_parameters') or []) else 'No'))
+                    'Yes' if 'tools' in (row.get('supported_parameters') or []) else 'No',
+                    test['status'] if test else 'Untested'))
+            if old and table.exists(old[0]):
+                table.selection_set(old[0])
             count.set(f'{len(rows):,} shown / {len(self.models):,} fetched • Catalog: {self.models_fetched}')
+        self.model_browser_refresh = update
+        def selected():
+            rows = table.selection()
+            if not rows:
+                raise ValueError('Select a model from the list first.')
+            return rows[0]
+        def favorite():
+            model = selected()
+            favorites = self.data['favorites']
+            if model in favorites:
+                favorites.remove(model)
+            else:
+                favorites.append(model)
+            self.save()
+            update()
         def choose(_event=None):
-            selected = table.selection()
-            if not selected:
-                messagebox.showinfo('Select a model', 'Select a model from the list first.', parent=window)
-                return
-            model = selected[0]
-            if not model.startswith('anthropic/claude-'):
-                if not messagebox.askyesno('Model compatibility', 'Claude Code is optimized for Claude models. Other models may fail or behave differently. Select this model anyway?', parent=window):
-                    return
-            self.model.set(model)
             try:
+                model = selected()
+                if not model.startswith('anthropic/claude-') and not messagebox.askyesno('Model compatibility',
+                    'Other providers may not fully work with Claude Code. Select this model anyway?', parent=window):
+                    return
+                self.model.set(model)
+                recent = self.data['recent_models']
+                self.data['recent_models'] = [model] + [r for r in recent if r != model][:19]
                 self.save()
-            except OSError:
-                messagebox.showerror('Save failed', 'Model selected but preferences could not be saved.', parent=window)
-                return
-            self.status.set('Selected model: ' + model + '. Used for future launches.')
+                self.status.set('Selected model: ' + model + '. Used for future launches.')
+                window.destroy()
+                self.model_browser_refresh = None
+            except Exception as exc:
+                messagebox.showerror('Model selection failed', str(exc), parent=window)
+        def close_browser():
+            self.model_browser_refresh = None
             window.destroy()
-        for variable in (search, claude_only, tools_only):
+        window.protocol('WM_DELETE_WINDOW', close_browser)
+        for variable in (search, claude_only, tools_only, free_only, provider, view, sort):
             variable.trace_add('write', update)
         table.bind('<Double-1>', choose)
         table.bind('<Return>', choose)
         ttk.Label(frame, textvariable=count).pack(anchor='w', pady=8)
-        ttk.Label(frame, text='Catalog prices are estimates in USD. Availability, endpoint capabilities and actual billing can vary.', wraplength=1000).pack(anchor='w')
+        ttk.Label(frame, text='Prices are catalog estimates. Free means listed text input/output and request price are zero; other fees can apply. API probe results apply to the active key and do not guarantee full CLI compatibility.', wraplength=1200).pack(anchor='w')
         bottom = ttk.Frame(frame)
         bottom.pack(fill='x', pady=10)
         ttk.Button(bottom, text='Use selected model', command=choose).pack(side='left')
-        ttk.Button(bottom, text='Close', command=window.destroy).pack(side='right')
+        ttk.Button(bottom, text='Toggle favorite', command=lambda: self.safe(favorite)).pack(side='left', padx=8)
+        ttk.Button(bottom, text='Test model', command=lambda: self.safe(lambda: self.test_model(selected()))).pack(side='left')
+        ttk.Button(bottom, text='Close', command=close_browser).pack(side='right')
         update()
 
     def browse_project(self):
@@ -512,6 +908,10 @@ class Manager(tk.Tk):
             command = '"' + binary + '"'
             subprocess.Popen([os.environ.get('COMSPEC', 'cmd.exe'), '/d', '/k', command],
                              cwd=str(project), env=env, creationflags=subprocess.CREATE_NEW_CONSOLE)
+        chosen = self.model.get().strip()
+        if chosen:
+            self.data['recent_models'] = [chosen] + [r for r in self.data['recent_models'] if r != chosen][:19]
+            self.save()
         self.status.set('Claude launched. Run /status inside its terminal to verify OpenRouter routing.')
 
     def help(self):
