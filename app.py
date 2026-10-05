@@ -65,7 +65,13 @@ def atomic_json(path, data):
         temp.unlink(missing_ok=True)
 
 
+def is_batch_model(model):
+    return 'batch' in model.strip().casefold().split(':')[1:]
+
+
 def launch_env(key, model, parent=None):
+    if is_batch_model(model):
+        raise ValueError('Batch-only models cannot run an interactive Claude session. Select the model without :batch.')
     env = dict(os.environ if parent is None else parent)
     for name in list(env):
         if name.startswith(('ANTHROPIC_', 'CLAUDE_CODE_USE_')) or name in {
@@ -111,7 +117,8 @@ def normalize_models(payload):
 def filter_models(models, search='', claude_only=True, tools_only=False):
     query = search.strip().casefold()
     return [row for row in models
-            if (not claude_only or row['id'].startswith('anthropic/claude-'))
+            if not is_batch_model(row['id'])
+            and (not claude_only or row['id'].startswith('anthropic/claude-'))
             and (not tools_only or 'tools' in (row.get('supported_parameters') or []))
             and (not query or query in (row['id'] + ' ' + str(row.get('name', ''))).casefold())]
 
@@ -472,6 +479,8 @@ class Manager(tk.Tk):
             self.cli.set(result)
 
     def launch(self):
+        if is_batch_model(self.model.get()):
+            raise ValueError('The saved model is batch-only. Fetch Models and select its version without :batch before launching.')
         item = next((x for x in self.data['keys'] if x['id'] == self.data['active']), None)
         if not item:
             raise ValueError('Activate an API key before launching.')
